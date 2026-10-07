@@ -1,0 +1,67 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Owner check is pinned to the immutable auth UID, not an email claim (an email can be re-created
+    // on a deleted account; a uid can't). Neil = plexusOwnerNeil (imported 2026-07-19). Add a second
+    // owner here AND in OWNER_UIDS in pay-tracker/app.jsx.
+    function isOwner() {
+      return request.auth != null && request.auth.uid in ['plexusOwnerNeil'];
+    }
+    // Delegated PTO approver — none yet. When one is named, pin the uid here AND in PTO_ADMIN_UIDS
+    // (app.jsx) AND backfill-mirrors.mjs. Grants NOTHING outside the two PTO stores.
+    function isPtoAdmin() {
+      return false;
+    }
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return request.auth != null && request.auth.uid == uid; }
+
+    // ---------- entity list (shared by the revenue tracker and the pay tracker) ----------
+    // plexus/entities = { value: { eid: {name, kind, active} } }. Every signed-in user may GET it
+    // (the pay tracker's shell needs the names/active flags to build tabs); only the owner writes.
+    // Everything else under plexus/ (owners, providers, …) stays owner-only via the catch-all below.
+    match /plexus/entities {
+      allow get: if signedIn();
+      allow list: if isOwner();
+      allow write: if isOwner();
+    }
+
+    // ---------- pay tracker: EVERY path is scoped to one entity (LLC) under pay/{eid} ----------
+    // Each LLC is a separate employer, so a person on two rosters has two independent docs
+    // (pay/pulm/entries/{uid} and pay/xyz/entries/{uid}) — nothing is shared across entities.
+    //
+    // The roster is OWNER-ONLY; admin-entered PTO is owner + PTO approver. Staff never read these;
+    // each person reads their own scoped copy from the `roster`/`adminPto` fields mirrored onto
+    // their own entries doc. Intentionally NOT gated on any user-writable field (a staffer can write
+    // their own entries doc, so a self-set "isManager" flag would be a privilege-escalation vector).
+    match /pay/{eid}/meta/employees {
+      allow read, write: if isOwner();
+    }
+    match /pay/{eid}/meta/ptoAdmin {
+      allow read, write: if isOwner() || isPtoAdmin();
+    }
+    // Non-sensitive shared docs (config = payroll calendar, manualLocks, manualUnlocks, send markers):
+    // any signed-in user may GET them (staff need the period-lock state and the calendar); only the
+    // owner writes. LIST is owner-only (a docId-dependent condition can't gate a list query; the
+    // backup sweep lists as owner). The app only ever GETs these.
+    match /pay/{eid}/meta/{docId} {
+      allow get: if signedIn() && !(docId in ['employees', 'ptoAdmin']);
+      allow list: if isOwner();
+      allow write: if isOwner();
+    }
+    // Per-user pay doc: own only (owner reads all). Holds entries + the person's mirrored
+    // salary/adj/roster/adminPto. The owner-only `salaries` and `adjustments` docs live in this same
+    // collection — safe because an auth uid can never equal those ids.
+    match /pay/{eid}/entries/{uid} {
+      allow read, write: if isOwner() || isSelf(uid);
+    }
+    // PTO self-requests: one doc per auth uid. Own only; owner + PTO approver read/write all.
+    match /pay/{eid}/pto/{uid} {
+      allow read, write: if isOwner() || isPtoAdmin() || isSelf(uid);
+    }
+
+    // ---------- revenue tracker (plexus_*, plexus/owners, …): owner-only, unchanged ----------
+    match /{document=**} {
+      allow read, write: if isOwner();
+    }
+  }
+}
