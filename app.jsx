@@ -11,6 +11,13 @@ const isOwnerUser = (u) => !!u && OWNER_UIDS.includes(String(u.uid||""));
 // so a self-set flag would show the tab — the rules pin is what makes that harmless).
 const PTO_ADMIN_UIDS = [];   // none yet — pin by auth uid here AND in firestore.rules isPtoAdmin()
 const isPtoAdminUid = (uid) => !!uid && PTO_ADMIN_UIDS.includes(uid);
+// Read-only viewers (the outside payroll accountant), pinned by auth UID. They see every entity's
+// Roll-up + ADP CSV export and can change NOTHING. The REAL gate is isViewer() in firestore.rules
+// (read-only grants on pay/** only; revenue stays owner-only) — keep the two lists in sync.
+const VIEWER_UIDS = [
+  "6dnMReS5zvXQXsvwyzkOXZ9vHlA3",   // outside payroll accountant (enters payroll into ADP) — 2026-11-02
+];
+const isViewerUser = (u) => !!u && VIEWER_UIDS.includes(String(u.uid||""));
 const FIXED = [
   { key: "consults",  label: "Consults",   rate: 60, unit: "ea" },
   { key: "followups", label: "Follow-ups", rate: 30, unit: "ea" },
@@ -150,7 +157,7 @@ function periodModel(cfgIn) {
     const anchor = /^\d{4}-\d{2}-\d{2}$/.test(String(cfg.anchor || "")) ? cfg.anchor : "2026-06-14";   // a Sunday
     const LEN = 14, off = Number(cfg.paydayOffset) >= 0 ? Number(cfg.paydayOffset) : 6;              // end (Sat) + 6 = Friday
     return {
-      cfg, perYear: 26,
+      cfg, perYear: 26, lockHours,
       periodIndexFor: (iso) => Math.floor(Math.floor((parseDate(iso) - parseDate(anchor)) / 86400000) / LEN),
       periodByIndex: (i) => { const start = addDays(parseDate(anchor), i * LEN), end = addDays(start, LEN - 1); return mk(i, start, end, addDays(end, off)); },
       describe: "Pay periods run Sunday–Saturday (14 days), paid " + off + " days after close; a period locks " + lockHours + " hours before payday.",
@@ -160,7 +167,7 @@ function periodModel(cfgIn) {
   const EPOCH_YEAR = 2026;
   const payDay = Math.min(28, Math.max(1, Math.round(Number(cfg.payday)) || DEFAULT_PAY_CFG.payday));
   return {
-    cfg, perYear: 12,
+    cfg, perYear: 12, lockHours,
     periodIndexFor: (iso) => { const [y, m] = String(iso).split("-").map(Number); return (y - EPOCH_YEAR) * 12 + (m - 1); },
     periodByIndex: (i) => {
       const y = EPOCH_YEAR + Math.floor(i / 12), m = ((i % 12) + 12) % 12;        // m = 0..11
@@ -692,9 +699,10 @@ function EntityApp({ eid, payCfg, authUser, header }) {
   const [toast, setToast] = useState("");
 
   const isOwner = isOwnerUser(authUser);
+  const isViewer = !isOwner && isViewerUser(authUser);   // read-only accountant: owner's reads, no writes
   const uid = authUser ? authUser.uid : null;
   // the signed-in NP's own employee record, matched by their real email or internal login email
-  const myEmp = (authUser && !isOwner)
+  const myEmp = (authUser && !isOwner && !isViewer)
     ? employees.find(e => {
         const ae = String(authUser.email||"").toLowerCase();
         return !!ae && String(e.email||"").trim().toLowerCase() === ae;
@@ -721,19 +729,20 @@ function EntityApp({ eid, payCfg, authUser, header }) {
     refreshBusy.current = true;
     try {
       const owner = isOwnerUser(u);
+      const all = owner || isViewerUser(u);   // owner + read-only viewer read every record; staff read their own
       // fire every read at once (they're independent) — was 8 sequential round-trips
       const [emps, locks, unlocks, entries, certs, salaries, mySalary, adjustments, myAdj, myPto, everyPto, adminPto] = await Promise.all([
         loadVisibleRoster(eid, u.uid),        // owner: full roster; everyone else (incl. managers): own mirror
         sGet(eid, "manualLocks", []),
         sGet(eid, "manualUnlocks", []),
-        owner ? loadAllEntries(eid) : loadEntriesForUid(eid, u.uid),
-        owner ? Promise.resolve({}) : loadCertsForUid(eid, u.uid),
-        owner ? loadSalaries(eid) : Promise.resolve({}),
-        owner ? Promise.resolve(0) : loadMySalary(u.uid),
-        owner ? loadAdjustments(eid) : Promise.resolve({}),
-        owner ? Promise.resolve({}) : loadMyAdj(u.uid),
+        all ? loadAllEntries(eid) : loadEntriesForUid(eid, u.uid),
+        all ? Promise.resolve({}) : loadCertsForUid(eid, u.uid),
+        all ? loadSalaries(eid) : Promise.resolve({}),
+        all ? Promise.resolve(0) : loadMySalary(u.uid),
+        all ? loadAdjustments(eid) : Promise.resolve({}),
+        all ? Promise.resolve({}) : loadMyAdj(u.uid),
         loadPto(eid, u.uid),                                  // the user's own PTO (owner has one too)
-        (owner || isPtoAdminUid(u.uid)) ? loadAllPto(eid) : Promise.resolve([]),   // owner + PTO approver: everyone's PTO
+        (all || isPtoAdminUid(u.uid)) ? loadAllPto(eid) : Promise.resolve([]),   // owner + PTO approver: everyone's PTO
         loadVisibleAdminPto(eid, u.uid),                      // owner: all admin PTO; NP: own scoped mirror
       ]);
       // only touch state that actually changed — an unchanged pull must not re-render, because
@@ -1079,7 +1088,7 @@ function EntityApp({ eid, payCfg, authUser, header }) {
   if (!loaded) return <div className="wrap">{header}<div className="empty">Loading…</div></div>;
 
   return (
-    <div className={"wrap" + (isOwner && !impersonate ? " wide" : "")}>
+    <div className={"wrap" + ((isOwner && !impersonate) || isViewer ? " wide" : "")}>
       {header}
 
       {/* owner "view as" → that employee's dashboard, editable, with a return bar */}
@@ -1111,10 +1120,20 @@ function EntityApp({ eid, payCfg, authUser, header }) {
           onViewAs={startImpersonate} syncedAt={syncedAt} onRefresh={refresh} showToast={showToast} />
       )}
 
+      {/* read-only viewer (payroll accountant) → the owner's Roll-up + ADP export, nothing editable.
+          Rules make every write fail for this uid regardless of the UI. */}
+      {isViewer && (
+        <>
+          <div className="fixed-note" style={{marginBottom:12}}>View-only access — you can see every pay period and export the ADP CSV; nothing here can be changed.</div>
+          <OwnerView readOnly employees={employees} entries={entries} salaries={salaries} adjustments={adjustments} manualLocks={manualLocks} manualUnlocks={manualUnlocks}
+            allPto={allPtoMerged} syncedAt={syncedAt} onRefresh={refresh} showToast={showToast} />
+        </>
+      )}
+
       {/* signed in as staff/manager → scoped entry screen. The delegated PTO approver
           additionally gets a "Time off" tab = the same PtoAdmin panel the owner uses
           (her mirror roster carries everyone, PTO fields only — rules enforce the rest). */}
-      {authUser && !isOwner && (
+      {authUser && !isOwner && !isViewer && (
         !myEmp
           ? <div className="card"><div className="empty">You're signed in, but your account isn't in the roster yet. Ask the owner to add your email in Employees &amp; rates, then sign out and back in.</div></div>
           : <>
@@ -1203,7 +1222,7 @@ function App() {
     (async () => {
       const ents = await loadEntities();
       const active = Object.entries(ents).filter(([, e]) => e && e.active !== false).map(([id]) => id).sort();
-      const mine = isOwnerUser(authUser) ? active : await probeMyEntities(authUser.uid, active);
+      const mine = (isOwnerUser(authUser) || isViewerUser(authUser)) ? active : await probeMyEntities(authUser.uid, active);
       const cfgs = {};
       await Promise.all(mine.map(async (id) => { cfgs[id] = await loadPayConfig(id); }));
       if (dead) return;
@@ -1667,7 +1686,7 @@ function EntryView({ emp, entries, upsertEntry, certs, certifyPeriod, manualLock
 }
 
 /* ---------- owner view ---------- */
-function OwnerView({ employees, entries, salaries, adjustments, manualLocks, manualUnlocks, setPeriodLock, persistEmployees, persistSalaries, persistAdjustments, deleteEntry, allPto, onSetPtoStatus, onAddPto, onViewAs, syncedAt, onRefresh, showToast }) {
+function OwnerView({ readOnly, employees, entries, salaries, adjustments, manualLocks, manualUnlocks, setPeriodLock, persistEmployees, persistSalaries, persistAdjustments, deleteEntry, allPto, onSetPtoStatus, onAddPto, onViewAs, syncedAt, onRefresh, showToast }) {
   const [sub, setSub] = useState("rollup");
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = async () => { setRefreshing(true); try { await onRefresh(); } finally { setRefreshing(false); } };
@@ -1679,9 +1698,11 @@ function OwnerView({ employees, entries, salaries, adjustments, manualLocks, man
       <div style={{display:"flex", flexWrap:"wrap", gap:10, alignItems:"center", justifyContent:"space-between", marginTop:"-6px", marginBottom:14}}>
         <div className="tabs" style={{margin:0}}>
           <button className={"tab"+(sub==="rollup"?" active":"")} onClick={()=>setSub("rollup")}>Roll-up</button>
+          {!readOnly && <>
           <button className={"tab"+(sub==="rates"?" active":"")} onClick={()=>setSub("rates")}>Employees &amp; rates</button>
           <button className={"tab"+(sub==="entries"?" active":"")} onClick={()=>setSub("entries")}>All entries</button>
           <button className={"tab"+(sub==="pto"?" active":"")} onClick={()=>setSub("pto")}>PTO{(() => { const n = (allPto||[]).filter(r=>r.status==="requested").length; return n ? " (" + n + ")" : ""; })()}</button>
+          </>}
         </div>
         <div style={{display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
           <div style={{display:"flex", alignItems:"center", gap:8, fontSize:12, color:"var(--muted)"}}>
@@ -1696,10 +1717,10 @@ function OwnerView({ employees, entries, salaries, adjustments, manualLocks, man
           )}
         </div>
       </div>
-      {sub==="rollup"  && <Rollup employees={employees} entries={entries} salaries={salaries} adjustments={adjustments} persistAdjustments={persistAdjustments} manualLocks={manualLocks} manualUnlocks={manualUnlocks} setPeriodLock={setPeriodLock} showToast={showToast} />}
-      {sub==="rates"   && <Rates employees={employees} salaries={salaries} persistEmployees={persistEmployees} persistSalaries={persistSalaries} showToast={showToast} />}
-      {sub==="entries" && <AllEntries employees={employees} entries={entries} deleteEntry={deleteEntry} showToast={showToast} />}
-      {sub==="pto"     && <PtoAdmin employees={employees} allPto={allPto} onSetStatus={onSetPtoStatus} onAddPto={onAddPto} showToast={showToast} />}
+      {sub==="rollup"  && <Rollup readOnly={readOnly} employees={employees} entries={entries} salaries={salaries} adjustments={adjustments} persistAdjustments={persistAdjustments} manualLocks={manualLocks} manualUnlocks={manualUnlocks} setPeriodLock={setPeriodLock} showToast={showToast} />}
+      {!readOnly && sub==="rates"   && <Rates employees={employees} salaries={salaries} persistEmployees={persistEmployees} persistSalaries={persistSalaries} showToast={showToast} />}
+      {!readOnly && sub==="entries" && <AllEntries employees={employees} entries={entries} deleteEntry={deleteEntry} showToast={showToast} />}
+      {!readOnly && sub==="pto"     && <PtoAdmin employees={employees} allPto={allPto} onSetStatus={onSetPtoStatus} onAddPto={onAddPto} showToast={showToast} />}
     </>
   );
 }
@@ -1718,7 +1739,7 @@ function payForEntry(emp, entry) {
   return total;
 }
 
-function Rollup({ employees, entries, salaries, adjustments, persistAdjustments, manualLocks, manualUnlocks, setPeriodLock, showToast }) {
+function Rollup({ readOnly, employees, entries, salaries, adjustments, persistAdjustments, manualLocks, manualUnlocks, setPeriodLock, showToast }) {
   const periods = periodList(10, 0);                 // selectable window — no future periods (until their first day)
   const [mode, setMode] = useState("period");        // "period" | "day" | "custom"
   const [periodIdx, setPeriodIdx] = useState(currentPeriodIndex());
@@ -1751,8 +1772,9 @@ function Rollup({ employees, entries, salaries, adjustments, persistAdjustments,
     const id = setTimeout(() => { adjDirty.current = false; persistAdjustments && persistAdjustments(adjDraft); }, 700);
     return () => clearTimeout(id);
   }, [adjDraft]);
-  const editable = mode === "period";   // overrides are per pay period
-  const periodAdj = (editable && adjDraft[periodIdx]) || {};
+  const adjApplies = mode === "period";               // overrides are per pay period: APPLIED for everyone who sees the roll-up
+  const editable = adjApplies && !readOnly;           // …but only the owner can edit them (read-only viewer sees the same totals)
+  const periodAdj = (adjApplies && adjDraft[periodIdx]) || {};
   const setAdj = (empId, field, value) => {
     adjDirty.current = true;
     setAdjDraft(d => {
@@ -2004,24 +2026,24 @@ function Rollup({ employees, entries, salaries, adjustments, persistAdjustments,
             </span>
             {locked ? (
               <span className="pill" style={{background:"var(--danger-soft)", color:"var(--danger)"}}>
-                🔒 Locked{manualLocked ? " (manual)" : autoLocked ? " (72h pre-payday)" : ""}
+                🔒 Locked{manualLocked ? " (manual)" : autoLocked ? " (" + PM.lockHours + "h pre-payday)" : ""}
               </span>
             ) : (
               <span className="pill" style={{background:"var(--accent-soft)", color:"var(--accent-ink)"}}>Open{forceUnlocked && autoLocked ? " (admin override)" : ""}</span>
             )}
-            <button className="btn btn-ghost" style={{padding:"5px 12px", fontSize:13}}
+            {!readOnly && <button className="btn btn-ghost" style={{padding:"5px 12px", fontSize:13}}
               onClick={()=>{ setPeriodLock(periodIdx, !locked); showToast(locked ? "Period unlocked" : "Period locked"); }}>
               {locked ? "Unlock period" : "Lock period now"}
-            </button>
+            </button>}
           </div>
           {autoLocked && !manualLocked && !forceUnlocked && (
             <div className="fixed-note" style={{marginTop:6}}>
-              Auto-locked because it's within 72 hours of payday. New entries dated in this period will be flagged below. Use “Unlock period” to override.
+              Auto-locked because it's within {PM.lockHours} hours of payday. New entries dated in this period will be flagged below. Use “Unlock period” to override.
             </div>
           )}
           {forceUnlocked && autoLocked && (
             <div className="fixed-note" style={{marginTop:6, color:"var(--amber)"}}>
-              ⚠ You've manually unlocked this period even though it's within 72 hours of payday — entries can be edited again.
+              ⚠ You've manually unlocked this period even though it's within {PM.lockHours} hours of payday — entries can be edited again.
             </div>
           )}
         </div>

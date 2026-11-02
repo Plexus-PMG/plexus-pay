@@ -12,6 +12,12 @@ service cloud.firestore {
     function isPtoAdmin() {
       return false;
     }
+    // Read-only viewer (the outside payroll accountant, 2026-11-02): READ on
+    // the pay tracker (pay/**) only — never a write, never the revenue collections. Pin the uid here AND
+    // in VIEWER_UIDS (app.jsx).
+    function isViewer() {
+      return request.auth != null && request.auth.uid in ['6dnMReS5zvXQXsvwyzkOXZ9vHlA3'];
+    }
     function signedIn() { return request.auth != null; }
     function isSelf(uid) { return request.auth != null && request.auth.uid == uid; }
 
@@ -34,10 +40,12 @@ service cloud.firestore {
     // their own entries doc. Intentionally NOT gated on any user-writable field (a staffer can write
     // their own entries doc, so a self-set "isManager" flag would be a privilege-escalation vector).
     match /pay/{eid}/meta/employees {
-      allow read, write: if isOwner();
+      allow read: if isOwner() || isViewer();
+      allow write: if isOwner();
     }
     match /pay/{eid}/meta/ptoAdmin {
-      allow read, write: if isOwner() || isPtoAdmin();
+      allow read: if isOwner() || isPtoAdmin() || isViewer();
+      allow write: if isOwner() || isPtoAdmin();
     }
     // Non-sensitive shared docs (config = payroll calendar, manualLocks, manualUnlocks, send markers):
     // any signed-in user may GET them (staff need the period-lock state and the calendar); only the
@@ -52,11 +60,13 @@ service cloud.firestore {
     // salary/adj/roster/adminPto. The owner-only `salaries` and `adjustments` docs live in this same
     // collection — safe because an auth uid can never equal those ids.
     match /pay/{eid}/entries/{uid} {
-      allow read, write: if isOwner() || isSelf(uid);
+      allow read: if isOwner() || isViewer() || isSelf(uid);
+      allow write: if isOwner() || (isSelf(uid) && !isViewer());   // the viewer can't even write its own doc
     }
     // PTO self-requests: one doc per auth uid. Own only; owner + PTO approver read/write all.
     match /pay/{eid}/pto/{uid} {
-      allow read, write: if isOwner() || isPtoAdmin() || isSelf(uid);
+      allow read: if isOwner() || isPtoAdmin() || isViewer() || isSelf(uid);
+      allow write: if isOwner() || isPtoAdmin() || (isSelf(uid) && !isViewer());
     }
 
     // ---------- revenue tracker (plexus_*, plexus/owners, …): owner-only, unchanged ----------
